@@ -41,6 +41,7 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
     {
         $this->write('Migrating ' . $tableName . '.id to UUIDs...');
         $this->prepare($tableName);
+
         $this->addUuidFields($uuidColumnName);
         $this->generateUuidsToReplaceIds($uuidColumnName);
         $this->addThoseUuidsToTablesWithFK();
@@ -76,6 +77,7 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
             foreach ($foreignKeys as $foreignKey) {
                 $key = $foreignKey->getColumns()[0];
                 if ($foreignKey->getForeignTableName() === $this->table) {
+
                     $fk = [
                       'table' => $table->getName(),
                       'key' => $key,
@@ -87,6 +89,16 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
                     if ($foreignKey->onDelete()) {
                         $fk['onDelete'] = $foreignKey->onDelete();
                     }
+
+                    foreach ($this->schemaManager->listTableDetails($table->getName())->getIndexes() as $index) {
+                        if ($index->isUnique() && count($index->getColumns()) > 1 && in_array($key, $index->getColumns())) {
+                            $fk['uniqueMultipleKey'] = [
+                                'name' => $index->getName(),
+                                'columns' => $index->getColumns(),
+                            ];
+                        }
+                    }
+
                     $this->fks[] = $fk;
                 }
             }
@@ -164,6 +176,11 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
                 } catch (\Exception $e) {
                 }
             }
+
+            if (isset($fk['uniqueMultipleKey'])) {
+                $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP INDEX ' . $fk['uniqueMultipleKey']['name']);
+            }
+
             $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP FOREIGN KEY ' . $fk['name']);
             $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP COLUMN ' . $fk['key']);
         }
@@ -195,6 +212,11 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
                 } catch (\Exception $e) {
                 }
             }
+
+            if (isset($fk['uniqueMultipleKey'])) {
+                $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD UNIQUE ' . $fk['uniqueMultipleKey']['name'] . ' (' . implode(', ', $fk['uniqueMultipleKey']['columns']) . ')');
+            }
+
             $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD CONSTRAINT ' . $fk['name'] . ' FOREIGN KEY (' . $fk['key'] . ') REFERENCES ' . $this->table . ' (id)' .
               (isset($fk['onDelete']) ? ' ON DELETE ' . $fk['onDelete'] : '')
             );
