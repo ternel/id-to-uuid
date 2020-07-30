@@ -23,6 +23,7 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
     protected $idToUuidMap = [];
     protected $generator;
     protected $fks;
+    protected $extendedFks;
     protected $table;
 
     public function setContainer(ContainerInterface $container = null)
@@ -37,11 +38,14 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
     {
     }
 
-    public function migrate(string $tableName, string $uuidColumnName = '__uuid__')
+    public function migrate(string $tableName, string $uuidColumnName = '__uuid__', bool $extendToLevel2 = false)
     {
         $this->write('Migrating ' . $tableName . '.id to UUIDs...');
-        $this->prepare($tableName);
+        $this->prepare($tableName, $extendToLevel2);
 
+        if ($extendToLevel2) {
+            //dd($this->fks, $this->extendedFks);
+        }
         $this->addUuidFields($uuidColumnName);
         $this->generateUuidsToReplaceIds($uuidColumnName);
         $this->addThoseUuidsToTablesWithFK();
@@ -66,10 +70,11 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
         throw new \Exception('Unable to find ' . $key . 'in ' . $table);
     }
 
-    private function prepare(string $tableName)
+    private function prepare(string $tableName, bool $extendToLevel2)
     {
         $this->table = $tableName;
         $this->fks = [];
+        $this->extendedFks = [];
         $this->idToUuidMap = [];
 
         foreach ($this->schemaManager->listTables() as $table) {
@@ -77,7 +82,6 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
             foreach ($foreignKeys as $foreignKey) {
                 $key = $foreignKey->getColumns()[0];
                 if ($foreignKey->getForeignTableName() === $this->table) {
-
                     $fk = [
                       'table' => $table->getName(),
                       'key' => $key,
@@ -103,14 +107,52 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
                 }
             }
         }
+
         if (count($this->fks) > 0) {
             $this->write('-> Detected the following foreign keys :');
             foreach ($this->fks as $fk) {
                 $this->write('  * ' . $fk['table'] . '.' . $fk['key']);
+
+                if ($extendToLevel2) {
+                    foreach ($this->schemaManager->listTables() as $table) {
+                        $foreignKeys = $this->schemaManager->listTableForeignKeys($table->getName());
+                        foreach ($foreignKeys as $foreignKey) {
+                            $key = $foreignKey->getColumns()[0];
+                            if ($foreignKey->getForeignTableName() === $fk['table']
+                                //&& $table->getName() === $fk['table'] . '_translation'
+                            ) {
+                                $fk = [
+                                    'table' => $table->getName(),
+                                    'fkTable' => $fk['table'],
+                                    'key' => $key,
+                                    'tmpKey' => $key . '_to_uuid',
+                                    'nullable' => $this->isForeignKeyNullable($table, $key),
+                                    'name' => $foreignKey->getName(),
+                                    'primaryKey' => $table->getPrimaryKeyColumns(),
+                                ];
+                                if ($foreignKey->onDelete()) {
+                                    $fk['onDelete'] = $foreignKey->onDelete();
+                                }
+
+                                foreach ($this->schemaManager->listTableDetails($table->getName())->getIndexes() as $index) {
+                                    if ($index->isUnique() && count($index->getColumns()) > 1 && in_array($key, $index->getColumns())) {
+                                        $fk['uniqueMultipleKey'] = [
+                                            'name' => $index->getName(),
+                                            'columns' => $index->getColumns(),
+                                        ];
+                                    }
+                                }
+
+                                $this->extendedFks[] = $fk;
+                            }
+                        }
+                    }
+                }
             }
 
             return;
         }
+
         $this->write('-> 0 foreign key detected.');
     }
 
@@ -118,6 +160,9 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
     {
         $this->connection->executeQuery('ALTER TABLE ' . $this->table . " ADD $uuidColumnName CHAR(36) COMMENT '(DC2Type:guid)' FIRST");
         foreach ($this->fks as $fk) {
+            $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD ' . $fk['tmpKey'] . ' CHAR(36) COMMENT \'(DC2Type:guid)\'');
+        }
+        foreach ($this->extendedFks as $fk) {
             $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD ' . $fk['tmpKey'] . ' CHAR(36) COMMENT \'(DC2Type:guid)\'');
         }
     }
@@ -163,27 +208,69 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
                 }
             }
         }
+        foreach ($this->extendedFks as $fk) {
+            $selectPk = implode(',', $fk['primaryKey']);
+            $fetchs = $this->connection->fetchAll('SELECT ' . $selectPk . ', ' . $fk['key'] . ' FROM ' . $fk['table']);
+            if (count($fetchs) > 0) {
+                $this->write('  * Adding ' . count($fetchs) . ' UUIDs to "' . $fk['table'] . '.' . $fk['key'] . '"...');
+                foreach ($fetchs as $fetch) {
+                    // do something when the value of foreign key is not null
+                    if ($fetch[$fk['key']]) {
+                        $queryPk = array_flip($fk['primaryKey']);
+                        foreach ($queryPk as $key => $value) {
+                            $queryPk[$key] = $fetch[$key];
+                        }
+                        $this->connection->update(
+                          $fk['table'],
+                          [$fk['tmpKey'] => $this->idToUuidMap[$fetch[$fk['key']]]],
+                          $queryPk
+                        );
+                    }
+                }
+            }
+        }
     }
 
     private function deletePreviousFKs()
     {
         $this->write('-> Deleting previous id foreign keys...');
+        foreach ($this->extendedFks as $fk) {
+            $this->write('--> Extended');
+
+            $this->doDeletePreviousFKs($fk);
+        }
+
         foreach ($this->fks as $fk) {
-            if (isset($fk['primaryKey'])) {
+            $this->write('--> Normal');
+
+            $this->doDeletePreviousFKs($fk);
+        }
+    }
+
+    private function doDeletePreviousFKs(array $fk)
+    {
+        if (isset($fk['primaryKey'])) {
+            try {
+                // drop primary key if not already dropped
+                $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP PRIMARY KEY');
+            } catch (\Exception $e) {
+            }
+        }
+
+        if (isset($fk['uniqueMultipleKey'])) {
+            if ($fk['uniqueMultipleKey']['name'] === 'PRIMARY') {
                 try {
                     // drop primary key if not already dropped
                     $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP PRIMARY KEY');
                 } catch (\Exception $e) {
                 }
-            }
-
-            if (isset($fk['uniqueMultipleKey'])) {
+            } else {
                 $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP INDEX ' . $fk['uniqueMultipleKey']['name']);
             }
-
-            $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP FOREIGN KEY ' . $fk['name']);
-            $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP COLUMN ' . $fk['key']);
         }
+
+        $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP FOREIGN KEY ' . $fk['name']);
+        $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP COLUMN ' . $fk['key']);
     }
 
     private function renameNewFKsToPreviousNames()
@@ -192,18 +279,42 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
         foreach ($this->fks as $fk) {
             $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' CHANGE ' . $fk['tmpKey'] . ' ' . $fk['key'] . ' CHAR(36) ' . ($fk['nullable'] ? '' : 'NOT NULL ') . 'COMMENT \'(DC2Type:guid)\'');
         }
+        foreach ($this->extendedFks as $fk) {
+            $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' CHANGE ' . $fk['tmpKey'] . ' ' . $fk['key'] . ' CHAR(36) ' . ($fk['nullable'] ? '' : 'NOT NULL ') . 'COMMENT \'(DC2Type:guid)\'');
+        }
     }
 
     private function dropIdPrimaryKeyAndSetUuidToPrimaryKey(string $uuidColumnName)
     {
         $this->write('-> Creating the uuid primary key...');
         $this->connection->executeQuery('ALTER TABLE ' . $this->table . ' DROP PRIMARY KEY, DROP COLUMN id');
+        foreach ($this->extendedFks as $fk) {
+            try {
+                $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' DROP PRIMARY KEY, DROP COLUMN id');
+            } catch (\Exception $e) {
+            }
+        }
+
         $this->connection->executeQuery('ALTER TABLE ' . $this->table . " CHANGE $uuidColumnName id CHAR(36) NOT NULL COMMENT '(DC2Type:guid)'");
+        foreach ($this->extendedFks as $fk) {
+            try {
+                $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . " CHANGE $uuidColumnName id CHAR(36) NOT NULL COMMENT '(DC2Type:guid)'");
+            } catch (\Exception $e) {
+            }
+        }
+
         $this->connection->executeQuery('ALTER TABLE ' . $this->table . ' ADD PRIMARY KEY (id)');
+        foreach ($this->extendedFks as $fk) {
+            try {
+                $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD PRIMARY KEY (id)');
+            } catch (\Exception $e) {
+            }
+        }
     }
 
     private function restoreConstraintsAndIndexes()
     {
+        $this->write('-> Restore constrains and indexes...');
         foreach ($this->fks as $fk) {
             if (isset($fk['primaryKey'])) {
                 try {
@@ -214,11 +325,44 @@ class IdToUuidMigration extends AbstractMigration implements ContainerAwareInter
             }
 
             if (isset($fk['uniqueMultipleKey'])) {
-                $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD UNIQUE ' . $fk['uniqueMultipleKey']['name'] . ' (' . implode(', ', $fk['uniqueMultipleKey']['columns']) . ')');
+                if ($fk['uniqueMultipleKey']['name'] === 'PRIMARY') {
+                    try {
+                        $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD PRIMARY KEY (' . implode(', ', $fk['uniqueMultipleKey']['columns']) . ')');
+                    } catch (\Exception $e) {
+                    }
+                } else {
+                    $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD UNIQUE ' . $fk['uniqueMultipleKey']['name'] . ' (' . implode(', ', $fk['uniqueMultipleKey']['columns']) . ')');
+                }
             }
 
             $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD CONSTRAINT ' . $fk['name'] . ' FOREIGN KEY (' . $fk['key'] . ') REFERENCES ' . $this->table . ' (id)' .
               (isset($fk['onDelete']) ? ' ON DELETE ' . $fk['onDelete'] : '')
+            );
+            $this->connection->executeQuery('CREATE INDEX ' . str_replace('FK_', 'IDX_', $fk['name']) . ' ON ' . $fk['table'] . ' (' . $fk['key'] . ')');
+        }
+
+        foreach ($this->extendedFks as $fk) {
+            if (isset($fk['primaryKey'])) {
+                try {
+                    // restore primary key if not already restored
+                    $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD PRIMARY KEY (' . implode(',', $fk['primaryKey']) . ')');
+                } catch (\Exception $e) {
+                }
+            }
+
+            if (isset($fk['uniqueMultipleKey'])) {
+                if ($fk['uniqueMultipleKey']['name'] === 'PRIMARY') {
+                    try {
+                        $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD PRIMARY KEY (' . implode(', ', $fk['uniqueMultipleKey']['columns']) . ')');
+                    } catch (\Exception $e) {
+                    }
+                } else {
+                    $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD UNIQUE ' . $fk['uniqueMultipleKey']['name'] . ' (' . implode(', ', $fk['uniqueMultipleKey']['columns']) . ')');
+                }
+            }
+
+            $this->connection->executeQuery('ALTER TABLE ' . $fk['table'] . ' ADD CONSTRAINT ' . $fk['name'] . ' FOREIGN KEY (' . $fk['key'] . ') REFERENCES ' . $fk['fkTable'] . ' (id)' .
+                (isset($fk['onDelete']) ? ' ON DELETE ' . $fk['onDelete'] : '')
             );
             $this->connection->executeQuery('CREATE INDEX ' . str_replace('FK_', 'IDX_', $fk['name']) . ' ON ' . $fk['table'] . ' (' . $fk['key'] . ')');
         }
